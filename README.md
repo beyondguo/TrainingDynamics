@@ -54,8 +54,12 @@ Then, a data map (dataset cartography) is plotted based on these metrics:
 
 ## Other Extensions:
 Apart from the above usage, we can also compare the difference between two models (e.g. a strong model and a weak model) by computing the change of the dynamics. For example, we train a weak model (BERT-tiny) and strong model (RoBERTa-large) on SST2 dataset and plot their difference:
-![Data Map Comparison](examples/DataMapCompare.png)
+
+<img src="examples/DataMapCompare.png" alt="Data Map Comparison" width="200"/>
+<!-- ![Data Map Comparison](examples/DataMapCompare.png) -->
 
 You can find more detailed usage of this repo in our notebook `plot_demo.ipynb`.
 
-<center>*Have fun and fell free to give your feedback :)*</center>
+---
+
+*Have fun and fell free to give your feedback :)* 
