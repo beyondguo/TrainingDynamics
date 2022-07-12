@@ -185,6 +185,10 @@ def parse_args():
         action="store_true",
         help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
     )
+    parser.add_argument("--do_recording", action="store_true", help="Whether to record the training dynamics.")
+    parser.add_argument("--with_data_selection", action="store_true", help="Use only a selected subset of the training data for model training.")
+    parser.add_argument("--data_selection_region", default=None, choices=("easy","hard","ambiguous"), 
+                         help="Three regions from the dataset cartography: easy, hard and ambiguous")
     args = parser.parse_args()
 
     # Sanity checks
@@ -234,23 +238,6 @@ def main():
     if args.seed is not None:
         set_seed(args.seed)
 
-    # # Handle the repository creation
-    # if accelerator.is_main_process:
-    #     if args.push_to_hub:
-    #         if args.hub_model_id is None:
-    #             repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-    #         else:
-    #             repo_name = args.hub_model_id
-    #         repo = Repository(args.output_dir, clone_from=repo_name)
-
-    #         with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-    #             if "step_*" not in gitignore:
-    #                 gitignore.write("step_*\n")
-    #             if "epoch_*" not in gitignore:
-    #                 gitignore.write("epoch_*\n")
-    #     elif args.output_dir is not None:
-    #         os.makedirs(args.output_dir, exist_ok=True)
-    # accelerator.wait_for_everyone()
 
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
@@ -298,6 +285,26 @@ def main():
             label_list = raw_datasets["train"].unique("label")
             label_list.sort()  # Let's sort it for determinism
             num_labels = len(label_list)
+
+    # --------------------------- Data Selection: -----------------------------------
+    # data selection is ONLY applied on train set
+    if args.with_data_selection:
+        assert args.data_selection_region is not None, "You much specify `data_selection_region` when using `with_data_selection`"
+        model_name = args.model_name_or_path
+        if '/' in model_name:
+            model_name = model_name.split('/')[-1]
+        assert os.path.exists(f'dy_log/{args.task_name}/{model_name}/three_regions_data_indices.json'), "Selection indices file not found!"
+        with open(f'dy_log/{args.task_name}/{model_name}/three_regions_data_indices.json','r') as f:
+            three_regions_data_indices = json.loads(f.read())
+        selected_indices = three_regions_data_indices[args.data_selection_region]
+        raw_datasets['train'] = raw_datasets['train'].select(selected_indices)
+
+        logger.info("~~~~~ Applying Data Selection ~~~~~ ")
+        logger.info(f"~~~~~ Region: {args.data_selection_region} ")
+        logger.info(f"~~~~~ Size: {len(raw_datasets['train'])} ")
+        
+    # ----------------------------------------------------------------------------------------------------
+    # with open(f'dy_log/sst2/distilbert-base-cased/three_regions_data_indices.json','r') as f:
 
     # Load pretrained model and tokenizer
     #
@@ -522,18 +529,6 @@ def main():
     
     # ============================ Training Loop ============================
     for epoch in range(starting_epoch, args.num_train_epochs):
-        if accelerator.is_main_process:
-            if not os.path.exists(f'dy_log/{args.task_name}/'):
-                os.mkdir(f'dy_log/{args.task_name}/')
-            if not os.path.exists(f'dy_log/{args.task_name}/{args.model_name_or_path}'):
-                os.mkdir(f'dy_log/{args.task_name}/{args.model_name_or_path}')
-            log_path = f'dy_log/{args.task_name}/{args.model_name_or_path}/training_dynamics/'
-            if not os.path.exists(log_path):
-                os.mkdir(log_path)
-        
-        accelerator.wait_for_everyone() # 只在 main process 里面创建文件夹，然后让其他 process 等待 main process 创建完毕
-        log_path = f'dy_log/{args.task_name}/{args.model_name_or_path}/training_dynamics/'
-        print('-*-*-*- ',log_path, os.path.exists(log_path),accelerator.device)
 
         model.train()
         if args.with_tracking:
@@ -572,51 +567,63 @@ def main():
         # ------------------ Recording Training Dynamics --------------------
         # 在每一个epoch之后，对train set所有样本再过一遍，记录dynamics
         # 每个epoch单独一个文件
-        logger.info('---------- Recording Training Dynamics (Epoch %s) -----------'%epoch)
-        training_dynamics = []
-        all_ids = []
-        for step, batch in enumerate(tqdm(train_dataloader)):
-            # print('- - - - - - - - - -  ',len(batch['idx']), accelerator.device)
-            idx_list = batch['idx']#.tolist()
-            label_list = batch['labels']#.tolist()
-            batch = {k:v for k,v in batch.items() if k != 'idx'} 
-            logits_list = model(**batch).logits#.tolist() # [[],[],[],...] batch_size个[]
-            # 这里的关键：通过 gather 把每个 GPU上的结果合并
-            # 由于在使用多卡训练时，不同卡可能存在样本的重复，同一个卡也会对最后一个batch进行补齐，也会样本重复
-            # 使用 gather 的话，就可以按照原来的分配方式，逆着组合回去，就不用你自己处理了
-            # gather 之后的，在每个卡上，下述变量里包含的数量，都等同于只使用单卡进行训练时的数量
-            # 所以下面的for训练执行完之后，training_dynamics里就包含了全部样本，你在写入文件时，记住只在一个 process 中写入
-            idx_list, label_list, logits_list = accelerator.gather((idx_list, label_list, logits_list)) 
-            # print('idx_list', idx_list.shape, accelerator.device)
-            # print('label_list', label_list.shape, accelerator.device)
+        if args.do_recording:
+            if accelerator.is_main_process:
+                if not os.path.exists(f'dy_log/{args.task_name}/'):
+                    os.mkdir(f'dy_log/{args.task_name}/')
+                if not os.path.exists(f'dy_log/{args.task_name}/{args.model_name_or_path}'):
+                    os.mkdir(f'dy_log/{args.task_name}/{args.model_name_or_path}')
+                log_path = f'dy_log/{args.task_name}/{args.model_name_or_path}/training_dynamics/'
+                if not os.path.exists(log_path):
+                    os.mkdir(log_path)
             
-            for idx, label, logits in zip(idx_list.tolist(), label_list.tolist(), logits_list.tolist()):
-                if idx in all_ids: # 由于 data_loader 可能会对最后一个 batch 进行补全，所以这里要去掉重复的样本
-                    continue
-                all_ids.append(idx)
-                record = {'guid': idx, 'logits_epoch_%s'%epoch: logits, 'gold': label, 'device':str(accelerator.device)}
-                training_dynamics.append(record)
-        print(len(all_ids),len(list(set(all_ids))),str(accelerator.device))
+            accelerator.wait_for_everyone() # 只在 main process 里面创建文件夹，然后让其他 process 等待 main process 创建完毕
+            log_path = f'dy_log/{args.task_name}/{args.model_name_or_path}/training_dynamics/'
+            print('-*-*-*- ',log_path, os.path.exists(log_path),accelerator.device)
 
-        print('---- Num of training_dynamics: ',len(training_dynamics),' Device: ', str(accelerator.device))
-        if accelerator.is_main_process:
-            assert os.path.exists(log_path),log_path
-            writer = open(log_path + f'dynamics_epoch_{epoch}.jsonl', 'w') 
-            for record in training_dynamics:
-                writer.write(json.dumps(record) + "\n")
-            logger.info(f'Epoch {epoch} Saved to [{log_path}]')
-            writer.close()
-        accelerator.wait_for_everyone()
+            logger.info('---------- Recording Training Dynamics (Epoch %s) -----------'%epoch)
+            training_dynamics = []
+            all_ids = []
+            for step, batch in enumerate(tqdm(train_dataloader)):
+                # print('- - - - - - - - - -  ',len(batch['idx']), accelerator.device)
+                idx_list = batch['idx']#.tolist()
+                label_list = batch['labels']#.tolist()
+                batch = {k:v for k,v in batch.items() if k != 'idx'} 
+                logits_list = model(**batch).logits#.tolist() # [[],[],[],...] batch_size个[]
+                # 这里的关键：通过 gather 把每个 GPU上的结果合并
+                # 由于在使用多卡训练时，不同卡可能存在样本的重复，同一个卡也会对最后一个batch进行补齐，也会样本重复
+                # 使用 gather 的话，就可以按照原来的分配方式，逆着组合回去，就不用你自己处理了
+                # gather 之后的，在每个卡上，下述变量里包含的数量，都等同于只使用单卡进行训练时的数量
+                # 所以下面的for训练执行完之后，training_dynamics里就包含了全部样本，你在写入文件时，记住只在一个 process 中写入
+                idx_list, label_list, logits_list = accelerator.gather((idx_list, label_list, logits_list)) 
+                # print('idx_list', idx_list.shape, accelerator.device)
+                # print('label_list', label_list.shape, accelerator.device)
+                
+                for idx, label, logits in zip(idx_list.tolist(), label_list.tolist(), logits_list.tolist()):
+                    if idx in all_ids: # 由于 data_loader 可能会对最后一个 batch 进行补全，所以这里要去掉重复的样本
+                        continue
+                    all_ids.append(idx)
+                    record = {'guid': idx, 'logits_epoch_%s'%epoch: logits, 'gold': label, 'device':str(accelerator.device)}
+                    training_dynamics.append(record)
+            
+            if accelerator.is_main_process:
+                print('---- Num of training_dynamics: ',len(training_dynamics),' Device: ', str(accelerator.device))
+                print(len(all_ids),len(list(set(all_ids))),str(accelerator.device))
+                assert os.path.exists(log_path),log_path
+                writer = open(log_path + f'dynamics_epoch_{epoch}.jsonl', 'w') 
+                for record in training_dynamics:
+                    writer.write(json.dumps(record) + "\n")
+                logger.info(f'Epoch {epoch} Saved to [{log_path}]')
+                writer.close()
+            accelerator.wait_for_everyone()
         
         # ------------------------------------------------------------------------
-
-
 
         # evaluation (validation set)
         model.eval()
         samples_seen = 0
         for step, batch in enumerate(eval_dataloader):
-            batch = {k:v for k,v in batch.items() if k != 'idx'} # 需不需要设置device ？
+            batch = {k:v for k,v in batch.items() if k != 'idx'} 
             with torch.no_grad():
                 outputs = model(**batch)
             predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
@@ -634,7 +641,7 @@ def main():
             )
 
         eval_metric = metric.compute()
-        logger.info(f"epoch {epoch}: {eval_metric}")
+        logger.info(f"***Evaluation*** epoch {epoch}: {eval_metric}")
 
         if args.with_tracking:
             accelerator.log(
@@ -646,18 +653,6 @@ def main():
                 },
                 step=completed_steps,
             )
-
-        # if args.push_to_hub and epoch < args.num_train_epochs - 1:
-        #     accelerator.wait_for_everyone()
-        #     unwrapped_model = accelerator.unwrap_model(model)
-        #     unwrapped_model.save_pretrained(
-        #         args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-        #     )
-        #     if accelerator.is_main_process:
-        #         tokenizer.save_pretrained(args.output_dir)
-        #         repo.push_to_hub(
-        #             commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-        #         )
 
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"
