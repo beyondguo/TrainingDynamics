@@ -1,5 +1,5 @@
 # Only applied to training set
-
+# python data_selection.py --task_name qnli --model_name bert-base-cased --proportion 0.5 --burn_out 4
 import json
 import random
 random.seed(1)

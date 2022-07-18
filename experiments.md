@@ -7,6 +7,14 @@ Main params:
 - epochs 5
 ```
 
+- **`bert-base-cased`**
+- 100% train: 0.9105504587155964
+- 33% (easy): 0.8772935779816514
+- 33% (hard): 0.908256880733945
+- 33% (ambiguous): 0.9025229357798165
+
+---
+
 - **`distilbert-base-cased`**
 - 100% train: 0.9094036697247706
 - 33% (easy): 0.856651376146789
@@ -25,3 +33,4 @@ use the data selection by `distilbert-base-cased`
 - 33% (easy): 0.5389908256880734
 - 33% (hard): 0.5871559633027523
 - 33% (ambiguous): 0.6020642201834863
+

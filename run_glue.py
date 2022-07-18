@@ -336,6 +336,10 @@ def main():
         non_label_column_names = [name for name in raw_datasets["train"].column_names if name != "label"]
         if "sentence1" in non_label_column_names and "sentence2" in non_label_column_names:
             sentence1_key, sentence2_key = "sentence1", "sentence2"
+        elif "sentence" in non_label_column_names:  # for classical classification tasks, like sst2
+            sentence1_key, sentence2_key = ("sentence", None)
+        elif "question" in non_label_column_names and "sentence" in non_label_column_names: # for tasks like qnli
+            sentence1_key, sentence2_key = ("question", "sentence")
         else:
             if len(non_label_column_names) >= 2:
                 sentence1_key, sentence2_key = non_label_column_names[:2]

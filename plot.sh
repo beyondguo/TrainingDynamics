@@ -7,11 +7,11 @@
 # distilbert-base-cased
 # roberta-large
 
-export TASK_NAME=sst2
-export MODEL=bert-tiny
+export TASK_NAME=qnli
+export MODEL=bert-base-cased
 python -m dy_filtering \
     --plot \
-    --task_name sst2 \
+    --task_name $TASK_NAME \
     --model_dir dy_log/$TASK_NAME/$MODEL \
     --plots_dir dy_log/$TASK_NAME/$MODEL \
     --model $MODEL \

@@ -8,8 +8,8 @@
 # roberta-large
 
 
-export TASK_NAME=sst2
-export MODEL=prajjwal1/bert-tiny
+export TASK_NAME=qnli
+export MODEL=bert-base-cased
 python -m torch.distributed.launch --nproc_per_node 8 --use_env run_glue.py \
   --model_name_or_path $MODEL \
   --task_name $TASK_NAME \
