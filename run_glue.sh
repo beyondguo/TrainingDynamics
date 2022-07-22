@@ -28,28 +28,29 @@
 # =========== Train GLUE tasks =============
 # https://huggingface.co/datasets/glue
 
-# export TASK_NAME=sst2
-# export MODEL=bert-base-cased
-# python -m torch.distributed.launch --nproc_per_node 8 --use_env run_glue.py \
-#   --model_name_or_path $MODEL \
-#   --task_name $TASK_NAME \
-#   --max_length 128 \
-#   --per_device_train_batch_size 32 \
-#   --learning_rate 2e-5 \
-#   --num_train_epochs 5 \
-#   # --with_data_selection \
-#   # --data_selection_region ambiguous \
-#   # --output_dir tmp/$TASK_NAME/
-
-
-# =========== Use Your Own Dataset ========
-
+export TASK_NAME=cola
 export MODEL=bert-base-cased
+# CUDA_VISIBLE_DEVICES=3 python run_glue.py \
 python -m torch.distributed.launch --nproc_per_node 8 --use_env run_glue.py \
   --model_name_or_path $MODEL \
+  --task_name $TASK_NAME \
   --max_length 128 \
   --per_device_train_batch_size 32 \
   --learning_rate 2e-5 \
   --num_train_epochs 5 \
-  --train_file datasets/qnli-easy-hard_train.csv \
-  --validation_file datasets/qnli-easy-hard_valid.csv
+  # --with_data_selection \
+  # --data_selection_region ambiguous \
+  # --output_dir tmp/$TASK_NAME/
+
+
+# =========== Use Your Own Dataset ========
+
+# export MODEL=bert-base-cased
+# python -m torch.distributed.launch --nproc_per_node 8 --use_env run_glue.py \
+#   --model_name_or_path $MODEL \
+#   --max_length 128 \
+#   --per_device_train_batch_size 32 \
+#   --learning_rate 2e-5 \
+#   --num_train_epochs 5 \
+#   --train_file datasets/qnli-easy-hard_train.csv \
+#   --validation_file datasets/qnli-easy-hard_valid.csv

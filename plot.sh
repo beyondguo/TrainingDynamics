@@ -7,7 +7,7 @@
 # distilbert-base-cased
 # roberta-large
 
-export TASK_NAME=qnli
+export TASK_NAME=mnli
 export MODEL=bert-base-cased
 python -m dy_filtering \
     --plot \
@@ -15,5 +15,5 @@ python -m dy_filtering \
     --model_dir dy_log/$TASK_NAME/$MODEL \
     --plots_dir dy_log/$TASK_NAME/$MODEL \
     --model $MODEL \
-    --burn_out 4
+    --burn_out 5
 

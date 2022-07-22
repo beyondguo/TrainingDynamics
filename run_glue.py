@@ -61,6 +61,8 @@ task_to_keys = {
     "sst2": ("sentence", None),
     "stsb": ("sentence1", "sentence2"),
     "wnli": ("sentence1", "sentence2"),
+
+    "snli": ("premise", "hypothesis"),
 }
 
 
@@ -253,7 +255,10 @@ def main():
     # download the dataset.
     if args.task_name is not None:
         # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset("glue", args.task_name)
+        if args.task_name in ['snli']:
+            raw_datasets = load_dataset(args.task_name)
+        else:
+            raw_datasets = load_dataset("glue", args.task_name)
     else:
         # Loading the dataset from local csv or json file.
         data_files = {}
@@ -491,7 +496,10 @@ def main():
 
     # Get the metric function
     if args.task_name is not None:
-        metric = load_metric("glue", args.task_name)
+        if args.task_name == 'snli':
+            metric = load_metric("glue", 'mnli')
+        else:
+            metric = load_metric("glue", args.task_name)
     else:
         metric = load_metric("accuracy")
 
@@ -687,6 +695,8 @@ def main():
 
         model.eval()
         for step, batch in enumerate(eval_dataloader):
+            # batch中包含了idx字段，这里需要去除
+            batch = {k:v for k,v in batch.items() if k != 'idx'} 
             outputs = model(**batch)
             predictions = outputs.logits.argmax(dim=-1)
             metric.add_batch(

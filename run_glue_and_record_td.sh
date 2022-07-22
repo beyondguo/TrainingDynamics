@@ -8,9 +8,10 @@
 # roberta-large
 
 
-export TASK_NAME=qnli
+export TASK_NAME=mnli
 export MODEL=bert-base-cased
-python -m torch.distributed.launch --nproc_per_node 8 --use_env run_glue.py \
+# python -m torch.distributed.launch --nproc_per_node 1 --use_env run_glue.py \
+CUDA_VISIBLE_DEVICES=2 python run_glue.py \
   --model_name_or_path $MODEL \
   --task_name $TASK_NAME \
   --max_length 128 \
