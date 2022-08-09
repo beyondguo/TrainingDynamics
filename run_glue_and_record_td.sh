@@ -8,14 +8,16 @@
 # roberta-large
 
 
-export TASK_NAME=mnli
+export TASK_NAME=rte-noisy-0.4
 export MODEL=bert-base-cased
-# python -m torch.distributed.launch --nproc_per_node 1 --use_env run_glue.py \
-CUDA_VISIBLE_DEVICES=2 python run_glue.py \
+
+# python -m torch.distributed.launch --nproc_per_node 8 --use_env run_glue.py \
+CUDA_VISIBLE_DEVICES=7 python run_glue.py \
+  --seed 5 \
   --model_name_or_path $MODEL \
   --task_name $TASK_NAME \
   --max_length 128 \
   --per_device_train_batch_size 32 \
   --learning_rate 2e-5 \
-  --num_train_epochs 5 \
+  --num_train_epochs 10 \
   --do_recording \

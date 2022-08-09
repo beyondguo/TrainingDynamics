@@ -30,14 +30,17 @@
 
 export TASK_NAME=cola
 export MODEL=bert-base-cased
-# CUDA_VISIBLE_DEVICES=3 python run_glue.py \
-python -m torch.distributed.launch --nproc_per_node 8 --use_env run_glue.py \
+# python -m torch.distributed.launch --nproc_per_node 8 --use_env run_glue.py \
+CUDA_VISIBLE_DEVICES=4 python run_glue.py \
+  --seed 5 \
   --model_name_or_path $MODEL \
   --task_name $TASK_NAME \
   --max_length 128 \
   --per_device_train_batch_size 32 \
-  --learning_rate 2e-5 \
-  --num_train_epochs 5 \
+  --learning_rate 4e-5 \
+  --num_train_epochs 10 \
+  --continue_train \
+  --continue_num_train_epochs 5 
   # --with_data_selection \
   # --data_selection_region ambiguous \
   # --output_dir tmp/$TASK_NAME/

@@ -7,7 +7,7 @@
 # distilbert-base-cased
 # roberta-large
 
-export TASK_NAME=mnli
+export TASK_NAME=rte-noisy-0.4
 export MODEL=bert-base-cased
 python -m dy_filtering \
     --plot \

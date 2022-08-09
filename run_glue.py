@@ -24,7 +24,7 @@ from pathlib import Path
 
 import datasets
 import torch
-from datasets import load_dataset, load_metric
+from datasets import load_dataset, load_from_disk, load_metric
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -63,6 +63,13 @@ task_to_keys = {
     "wnli": ("sentence1", "sentence2"),
 
     "snli": ("premise", "hypothesis"),
+    
+    "boolq": ("question", "passage"),
+    "cb": ("premise", "hypothesis"),
+    
+    "mrpc-noisy":("sentence1", "sentence2"),
+    "rte-noisy":("sentence1", "sentence2"),
+
 }
 
 
@@ -73,7 +80,7 @@ def parse_args():
         type=str,
         default=None,
         help="The name of the glue task to train on.",
-        choices=list(task_to_keys.keys()),
+        # choices=list(task_to_keys.keys()),
     )
     parser.add_argument(
         "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
@@ -191,6 +198,9 @@ def parse_args():
     parser.add_argument("--with_data_selection", action="store_true", help="Use only a selected subset of the training data for model training.")
     parser.add_argument("--data_selection_region", default=None, choices=("easy","hard","ambiguous"), 
                          help="Three regions from the dataset cartography: easy, hard and ambiguous")
+    parser.add_argument("--continue_train", action="store_true")
+    parser.add_argument("--continue_num_train_epochs", type=int, default=5)
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -256,7 +266,17 @@ def main():
     if args.task_name is not None:
         # Downloading and loading a dataset from the hub.
         if args.task_name in ['snli']:
-            raw_datasets = load_dataset(args.task_name)
+            # raw_datasets = load_dataset(args.task_name)
+            raw_datasets = load_from_disk(f"datasets/{args.task_name}/with_idx")
+            # snli里包含了一些-1的label，得去掉
+            # 跟GLUE不同，SNLI包含了有标签的test set
+            # raw_datasets['train'] = raw_datasets['train'].filter(lambda x:x['label']!=-1)
+            # raw_datasets['validation'] = raw_datasets['validation'].filter(lambda x:x['label']!=-1)
+            # raw_datasets['test'] = raw_datasets['test'].filter(lambda x:x['label']!=-1)
+        elif args.task_name in ['boolq', 'cb', 'axb', 'axg']:
+            raw_datasets = load_dataset("super_glue", args.task_name)
+        elif 'noisy' in args.task_name:
+            raw_datasets = load_from_disk(f"datasets/{args.task_name}/with_idx")
         else:
             raw_datasets = load_dataset("glue", args.task_name)
     else:
@@ -275,7 +295,7 @@ def main():
     if args.task_name is not None:
         is_regression = args.task_name == "stsb"
         if not is_regression:
-            label_list = raw_datasets["train"].features["label"].names
+            label_list = raw_datasets["validation"].features["label"].names
             num_labels = len(label_list)
         else:
             num_labels = 1
@@ -287,7 +307,7 @@ def main():
         else:
             # A useful fast method:
             # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
-            label_list = raw_datasets["train"].unique("label")
+            label_list = raw_datasets["validation"].unique("label")
             label_list.sort()  # Let's sort it for determinism
             num_labels = len(label_list)
 
@@ -330,7 +350,11 @@ def main():
     # Preprocessing the datasets
     # --------------- GLUE tasks ---------------
     if args.task_name is not None:
-        sentence1_key, sentence2_key = task_to_keys[args.task_name]
+        if 'noisy' in args.task_name:
+            task_name = args.task_name.split('-')[0]
+            sentence1_key, sentence2_key = task_to_keys[task_name]
+        else:
+            sentence1_key, sentence2_key = task_to_keys[args.task_name]
     # --------------- Other tasks ---------------
     else:
         # Again, we try to have some nice defaults but don't hesitate to tweak to your use case.
@@ -498,6 +522,11 @@ def main():
     if args.task_name is not None:
         if args.task_name == 'snli':
             metric = load_metric("glue", 'mnli')
+        elif args.task_name in ['boolq','cb']:
+            metric = load_metric("super_glue", args.task_name)
+        elif 'noisy' in args.task_name:
+            task_name = args.task_name.split('-')[0]
+            metric = load_metric("glue", task_name)
         else:
             metric = load_metric("glue", args.task_name)
     else:
@@ -685,6 +714,12 @@ def main():
             # if args.push_to_hub:
             #     repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
 
+
+
+    # More evaluation
+    # e.g. 
+    # The mismatch evaluation for MNLI task
+    # The test set for tasks with an annotated test set, like SNLI
     if args.task_name == "mnli":
         # Final evaluation on mismatched validation set
         eval_dataset = processed_datasets["validation_mismatched"]
@@ -706,6 +741,96 @@ def main():
 
         eval_metric = metric.compute()
         logger.info(f"mnli-mm: {eval_metric}")
+
+    if args.task_name == "snli":
+            # Final evaluation on mismatched validation set
+            eval_dataset = processed_datasets["test"]
+            eval_dataloader = DataLoader(
+                eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
+            )
+            eval_dataloader = accelerator.prepare(eval_dataloader)
+
+            model.eval()
+            for step, batch in enumerate(eval_dataloader):
+                # batch中包含了idx字段，这里需要去除
+                batch = {k:v for k,v in batch.items() if k != 'idx'} 
+                outputs = model(**batch)
+                predictions = outputs.logits.argmax(dim=-1)
+                metric.add_batch(
+                    predictions=accelerator.gather(predictions),
+                    references=accelerator.gather(batch["labels"]),
+                )
+
+            eval_metric = metric.compute()
+            logger.info(f"snli-test: {eval_metric}")
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # after training, continue train on some data
+    import json
+    if args.continue_train:
+        with open(f'dy_log/{args.task_name}/bert-base-cased/three_regions_data_indices.json' ,'r') as f:
+            d = json.loads(f.read())
+        selected_train_dataset = train_dataset.filter(lambda x:x['idx'] in d['hard'])
+        print(selected_train_dataset)
+        selected_train_dataloader = DataLoader(
+            selected_train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
+        )
+        selected_train_dataloader = accelerator.prepare(selected_train_dataloader)
+
+        num_update_steps_per_epoch = math.ceil(len(selected_train_dataloader) / args.gradient_accumulation_steps)
+        continue_max_train_steps = args.continue_num_train_epochs * num_update_steps_per_epoch
+        continue_lr_scheduler = get_scheduler(
+            name=args.lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=args.num_warmup_steps,
+            num_training_steps=continue_max_train_steps,
+    )
+
+        for epoch in range(args.continue_num_train_epochs):
+            model.train()
+            if args.with_tracking:
+                total_loss = 0
+            for step, batch in enumerate(tqdm(selected_train_dataloader)):
+                # batch中包含了idx字段，这里需要去除
+                batch = {k:v for k,v in batch.items() if k != 'idx'} 
+                outputs = model(**batch)
+                loss = outputs.loss
+                # We keep track of the loss at each epoch
+                if args.with_tracking:
+                    total_loss += loss.detach().float()
+                loss = loss / args.gradient_accumulation_steps
+                accelerator.backward(loss)
+                optimizer.step()
+                continue_lr_scheduler.step()
+                optimizer.zero_grad()
+                    
+
+            # evaluation (validation set)
+            model.eval()
+            samples_seen = 0
+            for step, batch in enumerate(eval_dataloader):
+                batch = {k:v for k,v in batch.items() if k != 'idx'} 
+                with torch.no_grad():
+                    outputs = model(**batch)
+                predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+                predictions, references = accelerator.gather((predictions, batch["labels"]))
+                # If we are in a multiprocess environment, the last batch has duplicates
+                if accelerator.num_processes > 1:
+                    if step == len(eval_dataloader) - 1:
+                        predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
+                        references = references[: len(eval_dataloader.dataset) - samples_seen]
+                    else:
+                        samples_seen += references.shape[0]
+                metric.add_batch(
+                    predictions=predictions,
+                    references=references,
+                )
+
+            eval_metric = metric.compute()
+            logger.info(f"***Continue Evaluation*** epoch {epoch}: {eval_metric}")
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!    
 
     if args.output_dir is not None:
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
