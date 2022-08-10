@@ -200,7 +200,8 @@ def parse_args():
                          help="Three regions from the dataset cartography: easy, hard and ambiguous")
     parser.add_argument("--continue_train", action="store_true")
     parser.add_argument("--continue_num_train_epochs", type=int, default=5)
-
+    parser.add_argument("--log_name", type=str, default=None, help='if set, will create a log file recording the metrics')
+    parser.add_argument("--selected_indices_filename", type=str)
     args = parser.parse_args()
 
     # Sanity checks
@@ -250,6 +251,23 @@ def main():
     if args.seed is not None:
         set_seed(args.seed)
 
+
+    # creating log filed
+    def log_to_file(info=None):
+        if args.log_name is not None:
+            if accelerator.is_local_main_process:
+                if not os.path.exists(f'log/{args.task_name}'):
+                    os.mkdir(f'log/{args.task_name}')
+                with open(f'log/{args.task_name}/{args.log_name}.txt', 'a') as log_f:
+                    if info is not None:
+                        log_f.write(str(info)+'\n')
+    
+    import datetime
+    args_str = ' '.join([k+'='+str(args.__dict__[k]) for k in args.__dict__])
+    log_to_file('\n-------------------\n')
+    log_to_file(datetime.datetime.now())
+    log_to_file("- Key params:")
+    log_to_file(args_str)
 
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
@@ -484,7 +502,8 @@ def main():
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
+        # num_warmup_steps=args.num_warmup_steps,
+        num_warmup_steps=int(args.max_train_steps * 0.06),
         num_training_steps=args.max_train_steps,
     )
 
@@ -569,6 +588,7 @@ def main():
             resume_step -= starting_epoch * len(train_dataloader)
     
     # ============================ Training Loop ============================
+    log_to_file('Validation performance after each training epoch:')
     for epoch in range(starting_epoch, args.num_train_epochs):
 
         model.train()
@@ -683,6 +703,8 @@ def main():
 
         eval_metric = metric.compute()
         logger.info(f"***Evaluation*** epoch {epoch}: {eval_metric}")
+        log_to_file(eval_metric)
+        
 
         if args.with_tracking:
             accelerator.log(
@@ -721,6 +743,7 @@ def main():
     # The mismatch evaluation for MNLI task
     # The test set for tasks with an annotated test set, like SNLI
     if args.task_name == "mnli":
+        log_to_file('\nmis_match evaluation for MNLI:')
         # Final evaluation on mismatched validation set
         eval_dataset = processed_datasets["validation_mismatched"]
         eval_dataloader = DataLoader(
@@ -741,38 +764,45 @@ def main():
 
         eval_metric = metric.compute()
         logger.info(f"mnli-mm: {eval_metric}")
+        log_to_file(eval_metric)
 
     if args.task_name == "snli":
-            # Final evaluation on mismatched validation set
-            eval_dataset = processed_datasets["test"]
-            eval_dataloader = DataLoader(
-                eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
+        log_to_file('\ntest evaluation for SNLI:')
+        # Final evaluation on mismatched validation set
+        eval_dataset = processed_datasets["test"]
+        eval_dataloader = DataLoader(
+            eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
+        )
+        eval_dataloader = accelerator.prepare(eval_dataloader)
+
+        model.eval()
+        for step, batch in enumerate(eval_dataloader):
+            # batch中包含了idx字段，这里需要去除
+            batch = {k:v for k,v in batch.items() if k != 'idx'} 
+            outputs = model(**batch)
+            predictions = outputs.logits.argmax(dim=-1)
+            metric.add_batch(
+                predictions=accelerator.gather(predictions),
+                references=accelerator.gather(batch["labels"]),
             )
-            eval_dataloader = accelerator.prepare(eval_dataloader)
 
-            model.eval()
-            for step, batch in enumerate(eval_dataloader):
-                # batch中包含了idx字段，这里需要去除
-                batch = {k:v for k,v in batch.items() if k != 'idx'} 
-                outputs = model(**batch)
-                predictions = outputs.logits.argmax(dim=-1)
-                metric.add_batch(
-                    predictions=accelerator.gather(predictions),
-                    references=accelerator.gather(batch["labels"]),
-                )
-
-            eval_metric = metric.compute()
-            logger.info(f"snli-test: {eval_metric}")
+        eval_metric = metric.compute()
+        logger.info(f"snli-test: {eval_metric}")
+        log_to_file(eval_metric)
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     # after training, continue train on some data
-    import json
     if args.continue_train:
-        with open(f'dy_log/{args.task_name}/bert-base-cased/three_regions_data_indices.json' ,'r') as f:
-            d = json.loads(f.read())
-        selected_train_dataset = train_dataset.filter(lambda x:x['idx'] in d['hard'])
-        print(selected_train_dataset)
+        log_to_file(f'\nContinue Training with subset:')
+        # with open(f'dy_log/{args.task_name}/bert-base-cased/three_regions_data_indices.json' ,'r') as f:
+        #     d = json.loads(f.read())
+
+        with open(f'dy_log/{args.task_name}/{args.model_name_or_path}/{args.selected_indices_filename}.txt', 'r') as f:
+            selected_indices = [int(x) for x in f.readlines()]
+            
+        selected_train_dataset = train_dataset.filter(lambda x:x['idx'] in selected_indices)
+        accelerator.print(selected_train_dataset)
         selected_train_dataloader = DataLoader(
             selected_train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
         )
@@ -829,6 +859,7 @@ def main():
 
             eval_metric = metric.compute()
             logger.info(f"***Continue Evaluation*** epoch {epoch}: {eval_metric}")
+            log_to_file(eval_metric)
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!    
 

@@ -8,11 +8,11 @@
 # roberta-large
 
 
-export TASK_NAME=rte-noisy-0.4
-export MODEL=bert-base-cased
+export TASK_NAME=mrpc
+export MODEL=roberta-large
 
-# python -m torch.distributed.launch --nproc_per_node 8 --use_env run_glue.py \
-CUDA_VISIBLE_DEVICES=7 python run_glue.py \
+# CUDA_VISIBLE_DEVICES=7 python run_glue.py \
+python -m torch.distributed.launch --nproc_per_node 1 --use_env run_glue.py \
   --seed 5 \
   --model_name_or_path $MODEL \
   --task_name $TASK_NAME \

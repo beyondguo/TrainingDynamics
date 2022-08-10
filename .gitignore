@@ -10,6 +10,10 @@ test.ipynb
 
 # log
 /dy_log
+/log
 
 # data
 /datasets
+
+# models
+saved_models/
