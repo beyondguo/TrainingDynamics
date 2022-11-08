@@ -25,7 +25,10 @@ from pathlib import Path
 import datasets
 import torch
 from torch import nn
-from datasets import load_dataset, load_from_disk, load_metric
+import torch.nn.functional as F
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+
+from datasets import load_dataset, load_metric, load_from_disk
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -36,6 +39,7 @@ from accelerate.utils import set_seed
 from huggingface_hub import Repository
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
@@ -44,6 +48,8 @@ from transformers import (
     default_data_collator,
     get_scheduler,
 )
+from transformers.modeling_outputs import SequenceClassifierOutput
+
 # from transformers.utils import get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 
@@ -67,10 +73,8 @@ task_to_keys = {
     
     "boolq": ("question", "passage"),
     "cb": ("premise", "hypothesis"),
-    
-    "mrpc-noisy":("sentence1", "sentence2"),
-    "rte-noisy":("sentence1", "sentence2"),
-
+    # "mrpc-noisy":("sentence1", "sentence2"),
+    # "rte-noisy":("sentence1", "sentence2"),
 }
 
 
@@ -199,15 +203,15 @@ def parse_args():
     parser.add_argument("--with_data_selection", action="store_true", help="Use only a selected subset of the training data for model training.")
     parser.add_argument("--data_selection_region", default=None, choices=("easy","hard","ambiguous"), 
                          help="Three regions from the dataset cartography: easy, hard and ambiguous")
-    parser.add_argument("--continue_train", action="store_true")
-    parser.add_argument("--continue_num_train_epochs", type=int, default=5)
-    parser.add_argument("--log_name", type=str, default=None, help='if set, will create a log file recording the metrics')
-    parser.add_argument("--selected_indices_filename", type=str)
-    parser.add_argument("--do_lwf", action="store_true")
-    parser.add_argument("--train_with_sample_loss", action="store_true")
-    parser.add_argument("--continue_train_with_sample_loss", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--temperature", type=float, default=1., help="the temperature for the softmax in HCT model")
+    parser.add_argument("--mu", type=float, default=0.5, help="weight for the gate loss in HCT model")
+    parser.add_argument("--hard_inference", action="store_true", default=False, help="weight for the gate loss in HCT model")
+    parser.add_argument("--hard_with_ls", action="store_true", help="if set, use label_smoothing for hard expert")
+    parser.add_argument("--ls_weight", type=float, default=0.1, help="weight for label_smoothing")
+    parser.add_argument("--more_ambiguous", action="store_true", default=False, help="set to put more weights to ambiguous samples")
 
+    args = parser.parse_args()
+    
     # Sanity checks
     if args.task_name is None and args.train_file is None and args.validation_file is None:
         raise ValueError("Need either a task name or a training/validation file.")
@@ -223,6 +227,163 @@ def parse_args():
     #     assert args.output_dir is not None, "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
 
     return args
+
+from typing import List, Optional, Tuple, Union
+
+
+class HCTForSequenceClassification(nn.Module):
+    """
+    Modified from `BertForSequenceClassification` class
+    """
+    def __init__(self, model_name_or_path, config, temperature, mu, hard_with_ls=False, ls_weight=None, more_ambiguous=False):
+        super(HCTForSequenceClassification, self).__init__()
+        self.encoder = AutoModel.from_pretrained(model_name_or_path)
+        self.config = config
+        self.num_labels = config.num_labels
+        self.classifier_dropout = (
+        self.config.classifier_dropout if self.config.classifier_dropout is not None else self.config.hidden_dropout_prob
+    )
+        self.dropout = nn.Dropout(self.classifier_dropout)
+        self.classifier_easy = nn.Linear(self.config.hidden_size, config.num_labels)
+        self.classifier_hard = nn.Linear(self.config.hidden_size, config.num_labels)
+        # 2 experts: easy or hard
+        # gate output: 0 for easy, 1 for hard
+        self.hardness_gate = nn.Linear(self.config.hidden_size,2) 
+        
+        self.T = temperature
+        self.mu = mu
+        self.hard_with_ls = hard_with_ls
+        self.ls_weight = ls_weight
+        self.more_ambiguous = more_ambiguous
+
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        # the confidence value of a sample
+        confidences: Optional[torch.Tensor] = None,  
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ):
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.encoder(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        # the CLS vector
+        pooled_output = outputs[1]  
+        # gating:
+        logits_gate = self.hardness_gate(pooled_output)
+        gate_weights = F.softmax(logits_gate/self.T, dim=1) # 
+        # easy/hard experts:
+        pooled_output = self.dropout(pooled_output)
+        logits_easy = self.classifier_easy(pooled_output)
+        logits_hard = self.classifier_hard(pooled_output)
+
+        loss = None
+        loss_easy, loss_hard, gate_loss = None, None, None
+        if labels is not None:
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
+
+            if self.training:
+                # gating loss, 仅在 train 模式下才有
+                # confidences 其实相当于 easy 分支的概率，所以你还需要自己构造一个 hard prob
+                easy_probs = confidences.view(-1,1)
+                hard_probs = 1 - easy_probs
+                hardness_probs = torch.cat([easy_probs,hard_probs],dim=1)
+                gate_loss = F.kl_div(F.log_softmax(logits_gate, dim=-1), hardness_probs, reduction='batchmean')
+            else:
+                gate_loss = None
+            if self.config.problem_type == "regression":
+                loss_fct = MSELoss(reduction='none')
+                if self.num_labels == 1:
+                    loss_easy = loss_fct(logits_easy.squeeze(), labels.squeeze())
+                    loss_hard = loss_fct(logits_hard.squeeze(), labels.squeeze())
+                else:
+                    loss_easy = loss_fct(logits_easy, labels)
+                    loss_hard = loss_fct(logits_hard, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = CrossEntropyLoss(reduction='none') # reduction='none', 来得到每个sample的loss
+                loss_easy = loss_fct(logits_easy.view(-1, self.num_labels), labels.view(-1))
+                # hard 端使用 label smoothing，即原始 CE loss 和一个完全 smoothing loss 的加权平均
+                # 目前使用的是 torch 1.7 版本，所有只能自己手写，在1.10版本后可以直接设置 label smoothing
+                if self.hard_with_ls:
+                    loss_ls_fct = CrossEntropyLoss(reduction='none', label_smoothing=self.ls_weight)
+                    loss_hard = loss_ls_fct(logits_hard.view(-1, self.num_labels), labels.view(-1))
+                else:
+                    loss_hard = loss_fct(logits_hard.view(-1, self.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = BCEWithLogitsLoss(reduction='none')
+                loss_easy = loss_fct(logits_easy, labels)
+                loss_hard = loss_fct(logits_hard, labels)
+            
+            easy_hard_loss_cat = torch.cat([loss_easy.view(-1,1), loss_hard.view(-1,1)],dim=1)
+            # !!!
+            if self.more_ambiguous:
+                gate_weights = torch.where(gate_weights>0.5, 1-torch.abs(gate_weights-0.5), gate_weights)
+            
+            # way 1: weighted loss of easy and hard experts
+            # TODO: 这里的权重，最好归一化一下
+            weighted_loss = easy_hard_loss_cat * gate_weights
+
+            # !!!
+            # way 2: only easy expert
+            # easy_weights = gate_weights[:,0]
+            # batch_size = 32  # TODO
+            # easy_weights = easy_weights * batch_size / torch.sum(easy_weights) # 归一化
+            # weighted_loss = loss_easy * easy_weights
+            # 这个策略，对noise可能有效，对干净数据集反而影响效果
+
+
+            clf_loss = torch.mean(weighted_loss)
+
+            # only use easy expert
+            # easy_probs = gate_weights[:,0]
+            # easy_weights = torch.where(easy_probs>0.5, 1-torch.abs(easy_probs-0.5), easy_probs)
+
+            if self.training: # 只有 train 的时候才有 gate_loss
+                loss = self.mu * gate_loss + (1 - self.mu) * clf_loss
+            else:
+                loss = clf_loss
+        
+        if not return_dict:
+            output = (logits_gate,logits_easy, logits_hard,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits={"gate":logits_gate, "easy":logits_easy, "hard":logits_hard},
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+    
 
 
 def main():
@@ -256,23 +417,6 @@ def main():
         set_seed(args.seed)
 
 
-    # creating log filed
-    def log_to_file(info=None):
-        if args.log_name is not None:
-            if accelerator.is_local_main_process:
-                if not os.path.exists(f'log/{args.task_name}'):
-                    os.mkdir(f'log/{args.task_name}')
-                with open(f'log/{args.task_name}/{args.log_name}.txt', 'a') as log_f:
-                    if info is not None:
-                        log_f.write(str(info)+'\n')
-    
-    import datetime
-    args_str = ' '.join([k+'='+str(args.__dict__[k]) for k in args.__dict__])
-    log_to_file('\n-------------------\n')
-    log_to_file(datetime.datetime.now())
-    log_to_file("- Key params:")
-    log_to_file(args_str)
-
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
 
@@ -287,20 +431,13 @@ def main():
     # download the dataset.
     if args.task_name is not None:
         # Downloading and loading a dataset from the hub.
-        if args.task_name in ['snli']:
-            # raw_datasets = load_dataset(args.task_name)
-            raw_datasets = load_from_disk(f"datasets/{args.task_name}/with_idx")
-            # snli里包含了一些-1的label，得去掉
-            # 跟GLUE不同，SNLI包含了有标签的test set
-            # raw_datasets['train'] = raw_datasets['train'].filter(lambda x:x['label']!=-1)
-            # raw_datasets['validation'] = raw_datasets['validation'].filter(lambda x:x['label']!=-1)
-            # raw_datasets['test'] = raw_datasets['test'].filter(lambda x:x['label']!=-1)
-        elif args.task_name in ['boolq', 'cb', 'axb', 'axg']:
-            raw_datasets = load_dataset("super_glue", args.task_name)
-        elif 'noisy' in args.task_name:
-            raw_datasets = load_from_disk(f"datasets/{args.task_name}/with_idx")
-        else:
-            raw_datasets = load_dataset("glue", args.task_name)
+        # raw_datasets = load_dataset("glue", args.task_name)
+        # load processed GLUE dataset that contains 'confidence' value
+        raw_datasets = load_from_disk(f"../datasets/{args.task_name}/with_conf/")
+        assert 'confidence' in raw_datasets['train'].column_names, "the Train set must contain a 'confidence' column!!"
+        print("Yes! I have loaded it! ----------")
+
+        
     else:
         # Loading the dataset from local csv or json file.
         data_files = {}
@@ -313,18 +450,11 @@ def main():
     # See more about loading any type of standard or custom dataset at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
-
-
-
-
     # Labels
     if args.task_name is not None:
         is_regression = args.task_name == "stsb"
         if not is_regression:
-            if args.task_name == 'mnli':
-                label_list = raw_datasets["validation_matched"].features["label"].names
-            else:
-                label_list = raw_datasets["validation"].features["label"].names
+            label_list = raw_datasets["validation"].features["label"].names
             num_labels = len(label_list)
         else:
             num_labels = 1
@@ -366,19 +496,22 @@ def main():
     # download model & vocab.
     config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name_or_path,
-        from_tf=bool(".ckpt" in args.model_name_or_path),
-        config=config,
-        ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-    )
-    
+    # model = AutoModelForSequenceClassification.from_pretrained(
+    #     args.model_name_or_path,
+    #     from_tf=bool(".ckpt" in args.model_name_or_path),
+    #     config=config,
+    #     ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+    # )
+    hct_model = HCTForSequenceClassification(args.model_name_or_path, config, temperature=args.temperature, mu=args.mu, hard_with_ls=args.hard_with_ls, ls_weight=args.ls_weight, more_ambiguous=args.more_ambiguous)
+
+
+
     # 对非HF官方模型的名称的处理，只保留模型名
     if '/' in args.model_name_or_path:
         args.model_name_or_path = args.model_name_or_path.split('/')[-1]
 
     # Preprocessing the datasets
-    # --------------- GLUE tasks ---------------
+    # --------------- GLUE tasks (and some SuperGLUE tasks, like boolq/cb)---------------
     if args.task_name is not None:
         if 'noisy' in args.task_name:
             task_name = args.task_name.split('-')[0]
@@ -407,34 +540,34 @@ def main():
 
     # Some models have set the order of the labels to use, so let's make sure we do use it.
     label_to_id = None
-    if (
-        model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
-        and args.task_name is not None
-        and not is_regression
-    ):
-        # Some have all caps in their config, some don't.
-        label_name_to_id = {k.lower(): v for k, v in model.config.label2id.items()}
-        if list(sorted(label_name_to_id.keys())) == list(sorted(label_list)):
-            logger.info(
-                f"The configuration of the model provided the following label correspondence: {label_name_to_id}. "
-                "Using it!"
-            )
-            label_to_id = {i: label_name_to_id[label_list[i]] for i in range(num_labels)}
-        else:
-            logger.warning(
-                "Your model seems to have been trained with labels, but they don't match the dataset: ",
-                f"model labels: {list(sorted(label_name_to_id.keys()))}, dataset labels: {list(sorted(label_list))}."
-                "\nIgnoring the model labels as a result.",
-            )
-    elif args.task_name is None and not is_regression:
-        label_to_id = {v: i for i, v in enumerate(label_list)}
+    # if (
+    #     model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
+    #     and args.task_name is not None
+    #     and not is_regression
+    # ):
+    #     # Some have all caps in their config, some don't.
+    #     label_name_to_id = {k.lower(): v for k, v in model.config.label2id.items()}
+    #     if list(sorted(label_name_to_id.keys())) == list(sorted(label_list)):
+    #         logger.info(
+    #             f"The configuration of the model provided the following label correspondence: {label_name_to_id}. "
+    #             "Using it!"
+    #         )
+    #         label_to_id = {i: label_name_to_id[label_list[i]] for i in range(num_labels)}
+    #     else:
+    #         logger.warning(
+    #             "Your model seems to have been trained with labels, but they don't match the dataset: ",
+    #             f"model labels: {list(sorted(label_name_to_id.keys()))}, dataset labels: {list(sorted(label_list))}."
+    #             "\nIgnoring the model labels as a result.",
+    #         )
+    # elif args.task_name is None and not is_regression:
+    #     label_to_id = {v: i for i, v in enumerate(label_list)}
 
-    if label_to_id is not None:
-        model.config.label2id = label_to_id
-        model.config.id2label = {id: label for label, id in config.label2id.items()}
-    elif args.task_name is not None and not is_regression:
-        model.config.label2id = {l: i for i, l in enumerate(label_list)}
-        model.config.id2label = {id: label for label, id in config.label2id.items()}
+    # if label_to_id is not None:
+    #     model.config.label2id = label_to_id
+    #     model.config.id2label = {id: label for label, id in config.label2id.items()}
+    # elif args.task_name is not None and not is_regression:
+    #     model.config.label2id = {l: i for i, l in enumerate(label_list)}
+    #     model.config.id2label = {id: label for label, id in config.label2id.items()}
 
     padding = "max_length" if args.pad_to_max_length else False
 
@@ -452,6 +585,9 @@ def main():
             else:
                 # In all cases, rename the column to labels because the model will expect that.
                 result["labels"] = examples["label"]
+        
+        if "confidence" in examples:
+            result["confidences"] = examples["confidence"]
         return result
 
     with accelerator.main_process_first():
@@ -462,35 +598,17 @@ def main():
             # 以SST2为例，这里会把 ['sentence', 'label', 'idx'] 给去掉（不用担心label，因为上面已经新建了一个labels列）
             # remove_columns=raw_datasets["train"].column_names,  
             # 改为：
-            remove_columns=[c for c in raw_datasets["train"].column_names if c != 'idx'],  # 保留idx，其他的可以去掉
+            # 保留 idx 和 confidences，其他的可以去掉 (confidences 而不是 confidence，前者是模型要接收的名字)
+            # remove_columns=[c for c in raw_datasets["train"].column_names if c not in ['idx', 'confidences']],  
             desc="Running tokenizer on dataset",
         )
 
-    train_dataset = processed_datasets["train"]
-    
-    # ============================------------------------------
-    # 8.29 MNLI add reverse pair data
-    if False:
-        with open('HCT/mnli_easy_label2_top10k.txt','r') as f:
-            selected_ids = [int(x) for x in f.readlines()]
-        train_data = raw_datasets['train'].select(selected_ids)
-        orig_premise_list = train_data['premise']
-        orig_hypothesis_list = train_data['hypothesis']
-        new_train_data = train_data.remove_columns(['hypothesis','premise']).add_column('premise', orig_hypothesis_list).add_column('hypothesis', orig_premise_list)
-        
-        with accelerator.main_process_first():
-            processed_new_train_data = new_train_data.map(
-                preprocess_function,
-                batched=True,
-                remove_columns=[c for c in raw_datasets["train"].column_names if c != 'idx'],  # 保留idx，其他的可以去掉
-                desc="Running tokenizer on dataset",
-            )
-        from datasets import concatenate_datasets
-        train_dataset = concatenate_datasets([train_dataset,processed_new_train_data])
-    # ============================------------------------------
+    train_dataset = processed_datasets["train"].remove_columns([c for c in raw_datasets["train"].column_names if c not in ['idx', 'confidences']])
+    if args.task_name == 'mnli':
+        eval_dataset = processed_datasets["validation_matched"].remove_columns([c for c in raw_datasets["validation_matched"].column_names if c not in ['idx']])
+    else:
+        eval_dataset = processed_datasets["validation"].remove_columns([c for c in raw_datasets["validation"].column_names if c not in ['idx']])
 
-
-    eval_dataset = processed_datasets["validation_matched" if args.task_name == "mnli" else "validation"]
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
@@ -517,11 +635,11 @@ def main():
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [p for n, p in hct_model.named_parameters() if not any(nd in n for nd in no_decay)],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [p for n, p in hct_model.named_parameters() if any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
         },
     ]
@@ -537,14 +655,13 @@ def main():
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
         optimizer=optimizer,
-        # num_warmup_steps=args.num_warmup_steps,
-        num_warmup_steps=int(args.max_train_steps * 0.06),
+        num_warmup_steps=args.num_warmup_steps,
         num_training_steps=args.max_train_steps,
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    hct_model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        hct_model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed
@@ -576,8 +693,8 @@ def main():
     if args.task_name is not None:
         if args.task_name == 'snli':
             metric = load_metric("glue", 'mnli')
-        elif args.task_name in ['boolq','cb']:
-            metric = load_metric("super_glue", args.task_name)
+        elif args.task_name in ['boolq','cb','axb','axg']:
+            metric = load_metric("super_glue" ,args.task_name)
         elif 'noisy' in args.task_name:
             task_name = args.task_name.split('-')[0]
             metric = load_metric("glue", task_name)
@@ -623,31 +740,9 @@ def main():
             resume_step -= starting_epoch * len(train_dataloader)
     
     # ============================ Training Loop ============================
-    log_to_file('Validation performance after each training epoch:')
-
-    # ============================------------------------------
-    # 9.2 ambiguous first weight
-    from torch.nn import CrossEntropyLoss
-    # loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1)) 
-    my_loss_fct = CrossEntropyLoss(reduction="none")
-    def loss_fct_with_sample_weights(logits, labels, weights):
-        # weights: list
-        losses = my_loss_fct(logits.view(-1, num_labels), labels.view(-1))
-        weights = torch.Tensor(weights)
-        # weights = accelerator.prepare(weights)
-        weights = weights.to(accelerator.device)
-        return (losses * weights).mean()
-    
-    import pickle
-    with open('HCT/mnli-roberta-weight-a0.6-k4.weight', 'rb') as handle:
-        idx2weight = pickle.load(handle)
-    # ============================------------------------------
-
-
-
     for epoch in range(starting_epoch, args.num_train_epochs):
 
-        model.train()
+        hct_model.train()
         if args.with_tracking:
             total_loss = 0
         for step, batch in enumerate(train_dataloader):
@@ -656,18 +751,10 @@ def main():
                 if resume_step is not None and step < resume_step:
                     completed_steps += 1
                     continue
-        
-            if args.train_with_sample_loss:
-                sample_weights = [idx2weight[int(idx)] for idx in batch['idx']]
-                # batch中包含了idx字段，这里需要去除
-                batch = {k:v for k,v in batch.items() if k != 'idx'} 
-                outputs = model(**batch)
-                loss = loss_fct_with_sample_weights(outputs.logits, batch['labels'], sample_weights)
-            else:
-                # batch中包含了idx字段，这里需要去除
-                batch = {k:v for k,v in batch.items() if k != 'idx'} 
-                outputs = model(**batch)
-                loss = outputs.loss
+            # batch中包含了idx字段，这里需要去除
+            batch = {k:v for k,v in batch.items() if k != 'idx'} 
+            outputs = hct_model(**batch)
+            loss = outputs.loss
             # We keep track of the loss at each epoch
             if args.with_tracking:
                 total_loss += loss.detach().float()
@@ -692,66 +779,95 @@ def main():
         # ------------------ Recording Training Dynamics --------------------
         # 在每一个epoch之后，对train set所有样本再过一遍，记录dynamics
         # 每个epoch单独一个文件
-        if args.do_recording:
-            if accelerator.is_main_process:
-                if not os.path.exists(f'dy_log/{args.task_name}/'):
-                    os.mkdir(f'dy_log/{args.task_name}/')
-                if not os.path.exists(f'dy_log/{args.task_name}/{args.model_name_or_path}'):
-                    os.mkdir(f'dy_log/{args.task_name}/{args.model_name_or_path}')
-                log_path = f'dy_log/{args.task_name}/{args.model_name_or_path}/training_dynamics/'
-                if not os.path.exists(log_path):
-                    os.mkdir(log_path)
+        # if args.do_recording:
+        #     if accelerator.is_main_process:
+        #         if not os.path.exists(f'dy_log/{args.task_name}/'):
+        #             os.mkdir(f'dy_log/{args.task_name}/')
+        #         if not os.path.exists(f'dy_log/{args.task_name}/{args.model_name_or_path}'):
+        #             os.mkdir(f'dy_log/{args.task_name}/{args.model_name_or_path}')
+        #         log_path = f'dy_log/{args.task_name}/{args.model_name_or_path}/training_dynamics/'
+        #         if not os.path.exists(log_path):
+        #             os.mkdir(log_path)
             
-            accelerator.wait_for_everyone() # 只在 main process 里面创建文件夹，然后让其他 process 等待 main process 创建完毕
-            log_path = f'dy_log/{args.task_name}/{args.model_name_or_path}/training_dynamics/'
-            print('-*-*-*- ',log_path, os.path.exists(log_path),accelerator.device)
+        #     accelerator.wait_for_everyone() # 只在 main process 里面创建文件夹，然后让其他 process 等待 main process 创建完毕
+        #     log_path = f'dy_log/{args.task_name}/{args.model_name_or_path}/training_dynamics/'
+        #     print('-*-*-*- ',log_path, os.path.exists(log_path),accelerator.device)
 
-            logger.info('---------- Recording Training Dynamics (Epoch %s) -----------'%epoch)
-            training_dynamics = []
-            all_ids = []
-            for step, batch in enumerate(tqdm(train_dataloader)):
-                # print('- - - - - - - - - -  ',len(batch['idx']), accelerator.device)
-                idx_list = batch['idx']#.tolist()
-                label_list = batch['labels']#.tolist()
-                batch = {k:v for k,v in batch.items() if k != 'idx'} 
-                logits_list = model(**batch).logits#.tolist() # [[],[],[],...] batch_size个[]
-                # 这里的关键：通过 gather 把每个 GPU上的结果合并
-                # 由于在使用多卡训练时，不同卡可能存在样本的重复，同一个卡也会对最后一个batch进行补齐，也会样本重复
-                # 使用 gather 的话，就可以按照原来的分配方式，逆着组合回去，就不用你自己处理了
-                # gather 之后的，在每个卡上，下述变量里包含的数量，都等同于只使用单卡进行训练时的数量
-                # 所以下面的for训练执行完之后，training_dynamics里就包含了全部样本，你在写入文件时，记住只在一个 process 中写入
-                idx_list, label_list, logits_list = accelerator.gather((idx_list, label_list, logits_list)) 
-                # print('idx_list', idx_list.shape, accelerator.device)
-                # print('label_list', label_list.shape, accelerator.device)
+        #     logger.info('---------- Recording Training Dynamics (Epoch %s) -----------'%epoch)
+        #     training_dynamics = []
+        #     all_ids = []
+        #     for step, batch in enumerate(tqdm(train_dataloader)):
+        #         # print('- - - - - - - - - -  ',len(batch['idx']), accelerator.device)
+        #         idx_list = batch['idx']#.tolist()
+        #         label_list = batch['labels']#.tolist()
+        #         batch = {k:v for k,v in batch.items() if k != 'idx'} 
+        #         logits_list = model(**batch).logits#.tolist() # [[],[],[],...] batch_size个[]
+        #         # 这里的关键：通过 gather 把每个 GPU上的结果合并
+        #         # 由于在使用多卡训练时，不同卡可能存在样本的重复，同一个卡也会对最后一个batch进行补齐，也会样本重复
+        #         # 使用 gather 的话，就可以按照原来的分配方式，逆着组合回去，就不用你自己处理了
+        #         # gather 之后的，在每个卡上，下述变量里包含的数量，都等同于只使用单卡进行训练时的数量
+        #         # 所以下面的for训练执行完之后，training_dynamics里就包含了全部样本，你在写入文件时，记住只在一个 process 中写入
+        #         idx_list, label_list, logits_list = accelerator.gather((idx_list, label_list, logits_list)) 
+        #         # print('idx_list', idx_list.shape, accelerator.device)
+        #         # print('label_list', label_list.shape, accelerator.device)
                 
-                for idx, label, logits in zip(idx_list.tolist(), label_list.tolist(), logits_list.tolist()):
-                    if idx in all_ids: # 由于 data_loader 可能会对最后一个 batch 进行补全，所以这里要去掉重复的样本
-                        continue
-                    all_ids.append(idx)
-                    record = {'guid': idx, 'logits_epoch_%s'%epoch: logits, 'gold': label, 'device':str(accelerator.device)}
-                    training_dynamics.append(record)
+        #         for idx, label, logits in zip(idx_list.tolist(), label_list.tolist(), logits_list.tolist()):
+        #             if idx in all_ids: # 由于 data_loader 可能会对最后一个 batch 进行补全，所以这里要去掉重复的样本
+        #                 continue
+        #             all_ids.append(idx)
+        #             record = {'guid': idx, 'logits_epoch_%s'%epoch: logits, 'gold': label, 'device':str(accelerator.device)}
+        #             training_dynamics.append(record)
             
-            if accelerator.is_main_process:
-                print('---- Num of training_dynamics: ',len(training_dynamics),' Device: ', str(accelerator.device))
-                print(len(all_ids),len(list(set(all_ids))),str(accelerator.device))
-                assert os.path.exists(log_path),log_path
-                writer = open(log_path + f'dynamics_epoch_{epoch}.jsonl', 'w') 
-                for record in training_dynamics:
-                    writer.write(json.dumps(record) + "\n")
-                logger.info(f'Epoch {epoch} Saved to [{log_path}]')
-                writer.close()
-            accelerator.wait_for_everyone()
-        
+        #     if accelerator.is_main_process:
+        #         print('---- Num of training_dynamics: ',len(training_dynamics),' Device: ', str(accelerator.device))
+        #         print(len(all_ids),len(list(set(all_ids))),str(accelerator.device))
+        #         assert os.path.exists(log_path),log_path
+        #         writer = open(log_path + f'dynamics_epoch_{epoch}.jsonl', 'w') 
+        #         for record in training_dynamics:
+        #             writer.write(json.dumps(record) + "\n")
+        #         logger.info(f'Epoch {epoch} Saved to [{log_path}]')
+        #         writer.close()
+        #     accelerator.wait_for_everyone()
         # ------------------------------------------------------------------------
 
+        def hct_batch_inference(model, batch, hard_choice=True, T=1, single_expert=None):
+            model.eval()
+            with torch.no_grad():
+                outputs = model(**batch)
+            logits = outputs.logits
+
+            if not single_expert:
+                if hard_choice:
+                    expert_choices = torch.argmax(logits['gate'],dim=1) # expert choice for each sample in the batch
+                    chosen_logits = logits['easy'] * (1-expert_choices).view(-1,1) + logits['hard'] * expert_choices.view(-1,1)
+                    return chosen_logits
+                else:
+                    weights = F.softmax(logits['gate']/T, dim=1)
+                    # !!!
+                    if args.more_ambiguous:
+                        weights = torch.where(weights>0.5, 1-torch.abs(weights-0.5), weights)
+                    weighted_logits = logits['easy'] * weights[:,0].view(-1,1) + logits['hard'] * weights[:,1].view(-1,1)
+                    return weighted_logits
+            else:
+                assert single_expert in ['easy', 'hard']
+                return logits[single_expert]
+        
+        # def hct_batch_inference_single(model, batch, expert='easy'):
+        #     model.eval()
+        #     with torch.no_grad():
+        #         outputs = model(**batch)
+        #     logits = outputs.logits
+        #     return logits[expert]
+
+
         # evaluation (validation set)
-        model.eval()
+        # hard inference:
+        hct_model.eval()
         samples_seen = 0
         for step, batch in enumerate(eval_dataloader):
             batch = {k:v for k,v in batch.items() if k != 'idx'} 
-            with torch.no_grad():
-                outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+            logits = hct_batch_inference(hct_model, batch, hard_choice=True, T=args.temperature)  # , single_expert='easy'
+            predictions = logits.argmax(dim=-1) if not is_regression else logits.squeeze()
             predictions, references = accelerator.gather((predictions, batch["labels"]))
             # If we are in a multiprocess environment, the last batch has duplicates
             if accelerator.num_processes > 1:
@@ -764,11 +880,30 @@ def main():
                 predictions=predictions,
                 references=references,
             )
-
         eval_metric = metric.compute()
-        logger.info(f"***Evaluation*** epoch {epoch}: {eval_metric}")
-        log_to_file(eval_metric)
-        
+        logger.info(f"***Evaluation (hard inference) *** epoch {epoch}: {eval_metric}")
+
+        # soft inference:
+        hct_model.eval()
+        samples_seen = 0
+        for step, batch in enumerate(eval_dataloader):
+            batch = {k:v for k,v in batch.items() if k != 'idx'} 
+            logits = hct_batch_inference(hct_model, batch, hard_choice=False, T=args.temperature)  # , single_expert='easy'
+            predictions = logits.argmax(dim=-1) if not is_regression else logits.squeeze()
+            predictions, references = accelerator.gather((predictions, batch["labels"]))
+            # If we are in a multiprocess environment, the last batch has duplicates
+            if accelerator.num_processes > 1:
+                if step == len(eval_dataloader) - 1:
+                    predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
+                    references = references[: len(eval_dataloader.dataset) - samples_seen]
+                else:
+                    samples_seen += references.shape[0]
+            metric.add_batch(
+                predictions=predictions,
+                references=references,
+            )
+        eval_metric = metric.compute()
+        logger.info(f"***Evaluation (soft inference) *** epoch {epoch}: {eval_metric}")
 
         if args.with_tracking:
             accelerator.log(
@@ -789,222 +924,53 @@ def main():
     # ============================ End Training Loop ============================
 
 
-    if args.output_dir is not None and args.resume_from_checkpoint is None: # 提供了path，同时没有指定resume，说明是第一次跑
+    if args.output_dir is not None:
         accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model = accelerator.unwrap_model(hct_model)
+        unwrapped_model.save_pretrained(
+            args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+        )
         if accelerator.is_main_process:
-            unwrapped_model.save_pretrained(
-                args.output_dir, save_function=accelerator.save)
             tokenizer.save_pretrained(args.output_dir)
-
-        # accelerator.save_state(args.output_dir)
             # if args.push_to_hub:
             #     repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
 
-
-
-    # More evaluation
-    # e.g. 
-    # The mismatch evaluation for MNLI task
-    # The test set for tasks with an annotated test set, like SNLI
     if args.task_name == "mnli":
-        log_to_file('\nmis_match evaluation for MNLI:')
         # Final evaluation on mismatched validation set
-        eval_dataset = processed_datasets["validation_mismatched"]
+        # eval_dataset = processed_datasets["validation_mismatched"]
+        eval_dataset = processed_datasets["validation_mismatched"].remove_columns([c for c in raw_datasets["validation_mismatched"].column_names if c not in ['idx']])
         eval_dataloader = DataLoader(
             eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
         )
         eval_dataloader = accelerator.prepare(eval_dataloader)
 
-        model.eval()
+        hct_model.eval()
         for step, batch in enumerate(eval_dataloader):
-            # batch中包含了idx字段，这里需要去除
             batch = {k:v for k,v in batch.items() if k != 'idx'} 
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
+            # outputs = hct_model(**batch)
+            logits = hct_batch_inference(hct_model, batch, hard_choice=False, T=args.temperature)
+            predictions = logits.argmax(dim=-1)
             metric.add_batch(
                 predictions=accelerator.gather(predictions),
                 references=accelerator.gather(batch["labels"]),
             )
-
         eval_metric = metric.compute()
         logger.info(f"mnli-mm: {eval_metric}")
-        log_to_file(eval_metric)
 
     if args.task_name == "snli":
-        log_to_file('\ntest evaluation for SNLI:')
-        # Final evaluation on mismatched validation set
-        eval_dataset = processed_datasets["test"]
-        eval_dataloader = DataLoader(
-            eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
-        )
-        eval_dataloader = accelerator.prepare(eval_dataloader)
-
-        model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            # batch中包含了idx字段，这里需要去除
-            batch = {k:v for k,v in batch.items() if k != 'idx'} 
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            metric.add_batch(
-                predictions=accelerator.gather(predictions),
-                references=accelerator.gather(batch["labels"]),
-            )
-
-        eval_metric = metric.compute()
-        logger.info(f"snli-test: {eval_metric}")
-        log_to_file(eval_metric)
-
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    # after training, continue train on some data
-    if args.continue_train:
-        if args.do_lwf:
-            # load the orginal trained model
-            model_orig = AutoModelForSequenceClassification.from_pretrained(args.output_dir)
-            model_orig = accelerator.prepare(model_orig)
-            kld_loss_fct = nn.KLDivLoss(reduction="batchmean")
-
-        log_to_file(f'\nContinue Training with subset:')
-        # with open(f'dy_log/{args.task_name}/bert-base-cased/three_regions_data_indices.json' ,'r') as f:
-        #     d = json.loads(f.read())
-        #     selected_indices = d['ambiguous']
-
-        # with open(f'dy_log/{args.task_name}/bert-base-cased/{args.selected_indices_filename}.txt', 'r') as f:
-        #     selected_indices = [int(x) for x in f.readlines()]
-
-        # selected_train_dataset = train_dataset.filter(lambda x:x['idx'] in selected_indices)
-        selected_train_dataset = train_dataset
-        accelerator.print(selected_train_dataset)
-        selected_train_dataloader = DataLoader(
-            selected_train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
-        )
-        selected_train_dataloader = accelerator.prepare(selected_train_dataloader)
-
-        # optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-
-        num_update_steps_per_epoch = math.ceil(len(selected_train_dataloader) / args.gradient_accumulation_steps)
-        continue_max_train_steps = args.continue_num_train_epochs * num_update_steps_per_epoch
-        continue_lr_scheduler = get_scheduler(
-            name=args.lr_scheduler_type,
-            optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps,
-            num_training_steps=continue_max_train_steps,
-    )
-
-        for epoch in range(args.continue_num_train_epochs):
-            model.train()
-            if args.with_tracking:
-                total_loss = 0
-            for step, batch in enumerate(tqdm(selected_train_dataloader)):
-                if args.continue_train_with_sample_loss:
-                    sample_weights = [idx2weight[int(idx)] for idx in batch['idx']]
-                    # batch中包含了idx字段，这里需要去除
-                    batch = {k:v for k,v in batch.items() if k != 'idx'} 
-                    outputs = model(**batch)
-                    loss = loss_fct_with_sample_weights(outputs.logits, batch['labels'], sample_weights)
-                else:
-                    # batch中包含了idx字段，这里需要去除
-                    batch = {k:v for k,v in batch.items() if k != 'idx'} 
-                    outputs = model(**batch)
-                    loss = outputs.loss
-                # We keep track of the loss at each epoch
-                if args.with_tracking:
-                    total_loss += loss.detach().float()
-                loss = loss / args.gradient_accumulation_steps
-
-                if args.do_lwf:
-                    model_orig.train()
-                    orig_outputs = model_orig(**batch)
-                    orig_logits = orig_outputs.logits
-                    new_logits = outputs.logits
-                    orig_logits = orig_logits.view(-1, orig_logits.size(-1))
-                    new_logits = new_logits.view(-1, new_logits.size(-1))
-
-                    args.temperature = 1
-                    args.alpha = 0.5
-                    distil_loss = kld_loss_fct(
-                                    nn.functional.log_softmax(new_logits / args.temperature, dim=-1),
-                                    nn.functional.softmax(orig_logits / args.temperature, dim=-1),
-                                 ) * (args.temperature) ** 2
-                    loss = args.alpha * distil_loss + loss
-
-                    
-                accelerator.backward(loss)
-                optimizer.step()
-                continue_lr_scheduler.step()
-                optimizer.zero_grad()
-                    
-
-            # evaluation (validation set)
-            model.eval()
-            samples_seen = 0
-            for step, batch in enumerate(eval_dataloader):
-                batch = {k:v for k,v in batch.items() if k != 'idx'} 
-                with torch.no_grad():
-                    outputs = model(**batch)
-                predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-                predictions, references = accelerator.gather((predictions, batch["labels"]))
-                # If we are in a multiprocess environment, the last batch has duplicates
-                if accelerator.num_processes > 1:
-                    if step == len(eval_dataloader) - 1:
-                        predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
-                        references = references[: len(eval_dataloader.dataset) - samples_seen]
-                    else:
-                        samples_seen += references.shape[0]
-                metric.add_batch(
-                    predictions=predictions,
-                    references=references,
-                )
-
-            eval_metric = metric.compute()
-            logger.info(f"***Continue Evaluation*** epoch {epoch}: {eval_metric}")
-            log_to_file(eval_metric)
-    
-    if args.continue_train:
-        # More evaluation
-        # e.g. 
-        # The mismatch evaluation for MNLI task
-        # The test set for tasks with an annotated test set, like SNLI
-        if args.task_name == "mnli":
-            log_to_file('\nContinue, mis_match evaluation for MNLI:')
             # Final evaluation on mismatched validation set
-            eval_dataset = processed_datasets["validation_mismatched"]
+            eval_dataset = processed_datasets["test"].remove_columns([c for c in raw_datasets["test"].column_names if c not in ['idx']])
             eval_dataloader = DataLoader(
                 eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
             )
             eval_dataloader = accelerator.prepare(eval_dataloader)
 
-            model.eval()
+            hct_model.eval()
             for step, batch in enumerate(eval_dataloader):
                 # batch中包含了idx字段，这里需要去除
                 batch = {k:v for k,v in batch.items() if k != 'idx'} 
-                outputs = model(**batch)
-                predictions = outputs.logits.argmax(dim=-1)
-                metric.add_batch(
-                    predictions=accelerator.gather(predictions),
-                    references=accelerator.gather(batch["labels"]),
-                )
-
-            eval_metric = metric.compute()
-            logger.info(f"mnli-mm: {eval_metric}")
-            log_to_file(eval_metric)
-
-        if args.task_name == "snli":
-            log_to_file('\nContinue, test evaluation for SNLI:')
-            # Final evaluation on mismatched validation set
-            eval_dataset = processed_datasets["test"]
-            eval_dataloader = DataLoader(
-                eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
-            )
-            eval_dataloader = accelerator.prepare(eval_dataloader)
-
-            model.eval()
-            for step, batch in enumerate(eval_dataloader):
-                # batch中包含了idx字段，这里需要去除
-                batch = {k:v for k,v in batch.items() if k != 'idx'} 
-                outputs = model(**batch)
-                predictions = outputs.logits.argmax(dim=-1)
+                logits = hct_batch_inference(hct_model, batch, hard_choice=False, T=args.temperature)
+                predictions = logits.argmax(dim=-1)
                 metric.add_batch(
                     predictions=accelerator.gather(predictions),
                     references=accelerator.gather(batch["labels"]),
@@ -1012,13 +978,11 @@ def main():
 
             eval_metric = metric.compute()
             logger.info(f"snli-test: {eval_metric}")
-            log_to_file(eval_metric)
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!    
 
-    # if args.output_dir is not None:
-    #     with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-    #         json.dump({"eval_accuracy": eval_metric["accuracy"]}, f)
+
+    if args.output_dir is not None:
+        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
+            json.dump({"eval_accuracy": eval_metric["accuracy"]}, f)
 
 
 if __name__ == "__main__":

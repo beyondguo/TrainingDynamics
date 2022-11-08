@@ -5,9 +5,8 @@ __pycache__/
 .DS_Store
 .vscode
 /tmp
-/HCT
-test.ipynb
 
+.empty/
 # log
 /dy_log
 /log
@@ -17,3 +16,4 @@ test.ipynb
 
 # models
 saved_models/
+HCT/*.weight
